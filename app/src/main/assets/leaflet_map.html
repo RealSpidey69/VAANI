@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: https://tile.openstreetmap.org; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'">
+    <link rel="stylesheet" href="leaflet/leaflet.css">
+    <style>
+        html, body { width: 100%; height: 100%; margin: 0; background: #0b0f0e; }
+        body { font-family: system-ui, sans-serif; position: relative; }
+        #map { position: absolute; inset: 0; width: 100%; height: 100%; }
+        .legend {
+            background: rgba(21, 29, 26, .96);
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(28, 28, 24, .18);
+            color: #eef5f1;
+            font-size: 12px;
+            line-height: 20px;
+            padding: 8px 10px;
+        }
+        .legend i { border-radius: 50%; display: inline-block; height: 10px; margin-right: 7px; width: 10px; }
+        .leaflet-tile-pane { filter: brightness(.68) saturate(.72) contrast(1.18); }
+        .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: #151d1a; color: #eef5f1; }
+        .leaflet-control-attribution { background: rgba(11,15,14,.82) !important; color: #b8c8c0; font-size: 9px; }
+        .leaflet-control-attribution a { color: #82d9b1; }
+        .user-tooltip {
+            background: #204637;
+            border: 0;
+            border-radius: 7px;
+            box-shadow: 0 2px 7px rgba(28, 28, 24, .25);
+            color: #fff;
+            font-weight: 700;
+            padding: 5px 8px;
+        }
+        .user-tooltip::before { border-top-color: #204637 !important; }
+        .recenter-control button {
+            align-items: center;
+            background: #151d1a;
+            border: 0;
+            color: #204637;
+            cursor: pointer;
+            display: flex;
+            font-size: 22px;
+            height: 34px;
+            justify-content: center;
+            width: 34px;
+        }
+        #tile-status {
+            align-items: center;
+            background: rgba(49, 49, 45, .94);
+            border-radius: 10px;
+            color: #fff;
+            display: flex;
+            font-size: 12px;
+            gap: 10px;
+            left: 50%;
+            max-width: calc(100% - 28px);
+            padding: 8px 10px;
+            position: absolute;
+            top: 12px;
+            transform: translateX(-50%);
+            z-index: 1200;
+        }
+        #tile-status.hidden { display: none; }
+        #retry-tiles {
+            background: #d9f3e5;
+            border: 0;
+            border-radius: 7px;
+            color: #204637;
+            cursor: pointer;
+            font-weight: 700;
+            padding: 6px 9px;
+        }
+    </style>
+</head>
+<body>
+<div id="map" aria-label="Interactive community safety map"></div>
+<div id="tile-status" role="status" aria-live="polite">
+    <span id="tile-status-message">Loading map tiles…</span>
+    <button id="retry-tiles" type="button">Retry Tiles</button>
+</div>
+<script src="leaflet/leaflet.js"></script>
+<script>
+    const DEFAULT_CENTER = [28.6335, 77.2199];
+    const map = L.map('map', { zoomControl: true }).setView(DEFAULT_CENTER, 13);
+    const tileStatus = document.getElementById('tile-status');
+    const tileStatusMessage = document.getElementById('tile-status-message');
+    const retryTilesButton = document.getElementById('retry-tiles');
+    let tileErrors = 0;
+
+    const tileLayer = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; OpenStreetMap contributors'
+    });
+
+    function showTileStatus(message, allowRetry) {
+        tileStatusMessage.textContent = message;
+        retryTilesButton.style.display = allowRetry ? 'inline-block' : 'none';
+        tileStatus.classList.remove('hidden');
+    }
+
+    function hideTileStatus() {
+        tileStatus.classList.add('hidden');
+    }
+
+    function retryTiles() {
+        if (!navigator.onLine) {
+            showTileStatus('Offline — connect to the internet to load map tiles.', true);
+            return;
+        }
+        tileErrors = 0;
+        showTileStatus('Reloading map tiles…', false);
+        tileLayer.redraw();
+        window.invalidateMapSize();
+    }
+
+    tileLayer.on('loading', () => showTileStatus('Loading map tiles…', false));
+    tileLayer.on('load', () => {
+        if (tileErrors === 0) hideTileStatus();
+        else if (!navigator.onLine) showTileStatus('Offline — connect to the internet to load map tiles.', true);
+        else showTileStatus('Some map tiles could not load.', true);
+    });
+    tileLayer.on('tileerror', () => {
+        tileErrors += 1;
+        showTileStatus('Some map tiles could not load.', true);
+    });
+    retryTilesButton.addEventListener('click', retryTiles);
+    window.addEventListener('offline', () => showTileStatus('Offline — connect to the internet to load map tiles.', true));
+    window.addEventListener('online', retryTiles);
+    tileLayer.addTo(map);
+
+    const riskLayer = L.layerGroup().addTo(map);
+    const corridorLayer = L.layerGroup().addTo(map);
+    const patrolLayer = L.layerGroup().addTo(map);
+    let userMarker = null;
+    let userAccuracyCircle = null;
+    let userLatLng = null;
+    let lastRecenterRequest = 0;
+
+    function distanceKm(a, b) {
+        const earthRadiusKm = 6371;
+        const lat1 = a[0] * Math.PI / 180;
+        const lat2 = b[0] * Math.PI / 180;
+        const dLat = lat2 - lat1;
+        const dLng = (b[1] - a[1]) * Math.PI / 180;
+        const value = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+        return earthRadiusKm * 2 * Math.atan2(Math.sqrt(value), Math.sqrt(1 - value));
+    }
+
+    function offsetPoint(center, northMeters, eastMeters) {
+        const latitude = center[0] + northMeters / 111320;
+        const longitudeScale = Math.max(1, 111320 * Math.abs(Math.cos(center[0] * Math.PI / 180)));
+        let longitude = center[1] + eastMeters / longitudeScale;
+        longitude = ((longitude + 540) % 360) - 180;
+        return [Math.max(-89.999, Math.min(89.999, latitude)), longitude];
+    }
+
+    function rebuildContextOverlays(latitude, longitude) {
+        const requested = [latitude, longitude];
+        const center = Number.isFinite(latitude) && Number.isFinite(longitude) &&
+            distanceKm(DEFAULT_CENTER, requested) > 50 ? requested : DEFAULT_CENTER;
+        corridorLayer.clearLayers();
+        patrolLayer.clearLayers();
+
+        const corridor = [
+            offsetPoint(center, -900, -520),
+            offsetPoint(center, -420, -260),
+            offsetPoint(center, 0, 0),
+            offsetPoint(center, 430, 300),
+            offsetPoint(center, 860, 560)
+        ];
+        L.polyline(corridor, { color: '#204637', weight: 7, opacity: .9 })
+            .bindPopup('<strong>Well-lit corridor</strong><br>Adaptive sample community route')
+            .addTo(corridorLayer);
+
+        [
+            [offsetPoint(center, -260, -320), 'Patrolled point · Local market'],
+            [offsetPoint(center, 380, 360), 'Patrolled point · Transit stop'],
+            [offsetPoint(center, -580, 260), 'Verified haven · 24-hour pharmacy']
+        ].forEach(item => {
+            L.circleMarker(item[0], {
+                radius: 8, color: '#52606a', fillColor: '#d3e2ed', fillOpacity: 1, weight: 3
+            }).bindPopup(`<strong>${item[1]}</strong><br><small>Adaptive sample support location</small>`)
+                .addTo(patrolLayer);
+        });
+    }
+
+    rebuildContextOverlays(DEFAULT_CENTER[0], DEFAULT_CENTER[1]);
+
+    const legend = L.control({ position: 'bottomleft' });
+    legend.onAdd = function () {
+        const box = L.DomUtil.create('div', 'legend');
+        box.innerHTML = '<div><i style="background:#b3261e"></i>Higher reported risk</div>' +
+            '<div><i style="background:#d97706"></i>Moderate reported risk</div>' +
+            '<div><i style="background:#204637"></i>Well-lit corridor</div>';
+        return box;
+    };
+    legend.addTo(map);
+
+    window.invalidateMapSize = function () {
+        // Android WebView can measure the native view correctly while resolving
+        // percentage and viewport CSS heights to 0px inside a Compose list.
+        const height = Math.max(window.innerHeight, document.documentElement.clientHeight);
+        if (height > 0) {
+            const pixels = `${height}px`;
+            document.documentElement.style.height = pixels;
+            document.body.style.height = pixels;
+            map.getContainer().style.height = pixels;
+        }
+        map.invalidateSize({ pan: false });
+        if (window.isMapReady()) notifyAndroidReady();
+    };
+
+    window.isMapReady = function () {
+        const container = map.getContainer();
+        const size = map.getSize();
+        return Boolean(container && container.clientWidth > 0 && container.clientHeight > 0 && size.x > 0 && size.y > 0);
+    };
+
+    function notifyAndroidReady() {
+        if (window.isMapReady() && window.AndroidBridge && window.AndroidBridge.onMapReady) {
+            window.AndroidBridge.onMapReady();
+        }
+    }
+
+    map.whenReady(window.invalidateMapSize);
+
+    window.recenterUserLocation = function () {
+        if (userLatLng) map.setView(userLatLng, 15, { animate: true });
+        window.invalidateMapSize();
+    };
+
+    window.requestRecenter = function (requestId) {
+        if (Number.isFinite(requestId) && requestId > lastRecenterRequest) {
+            lastRecenterRequest = requestId;
+            window.recenterUserLocation();
+        }
+    };
+
+    const RecenterControl = L.Control.extend({
+        options: { position: 'topright' },
+        onAdd: function () {
+            const container = L.DomUtil.create('div', 'leaflet-bar recenter-control');
+            const button = L.DomUtil.create('button', '', container);
+            button.type = 'button';
+            button.title = 'Recenter on your location';
+            button.setAttribute('aria-label', 'Recenter on your location');
+            button.textContent = '◎';
+            L.DomEvent.disableClickPropagation(container);
+            L.DomEvent.on(button, 'click', window.recenterUserLocation);
+            return container;
+        }
+    });
+    new RecenterControl().addTo(map);
+
+    window.setDangerZones = function (zones) {
+        riskLayer.clearLayers();
+        if (!Array.isArray(zones)) return;
+        zones.filter(zone => Number.isFinite(zone.lat) && zone.lat >= -90 && zone.lat <= 90 &&
+            Number.isFinite(zone.lng) && zone.lng >= -180 && zone.lng <= 180 &&
+            Number.isFinite(zone.radius) && zone.radius > 0).forEach(zone => {
+            const color = zone.level === 'high' ? '#b3261e' : '#d97706';
+            const popup = document.createElement('div');
+            const title = document.createElement('strong');
+            const detail = document.createElement('div');
+            const source = document.createElement('small');
+            title.textContent = zone.title;
+            detail.textContent = zone.detail;
+            source.textContent = 'Adaptive sample incident history';
+            popup.append(title, detail, source);
+            L.circle([zone.lat, zone.lng], {
+                color, fillColor: color, fillOpacity: .22, opacity: .85, radius: zone.radius, weight: 2
+            }).bindPopup(popup).addTo(riskLayer);
+        });
+    };
+
+    window.setSignalFilter = function (filter) {
+        const showRisk = filter === 'All Signals';
+        const showCorridors = filter === 'All Signals' || filter === 'Well-Lit Streets';
+        const showPatrol = filter === 'All Signals' || filter === 'Patrol Points';
+        if (showRisk) map.addLayer(riskLayer); else map.removeLayer(riskLayer);
+        if (showCorridors) map.addLayer(corridorLayer); else map.removeLayer(corridorLayer);
+        if (showPatrol) map.addLayer(patrolLayer); else map.removeLayer(patrolLayer);
+    };
+
+    window.setUserLocation = function (latitude, longitude, accuracyMeters, timestampMillis) {
+        if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return;
+        if (userMarker) map.removeLayer(userMarker);
+        if (userAccuracyCircle) map.removeLayer(userAccuracyCircle);
+        userLatLng = [latitude, longitude];
+        const accuracy = Number.isFinite(accuracyMeters) && accuracyMeters > 0 ? accuracyMeters : 40;
+        const updated = Number.isFinite(timestampMillis) ? new Date(timestampMillis) : new Date();
+
+        userAccuracyCircle = L.circle(userLatLng, {
+            radius: accuracy,
+            color: '#204637',
+            fillColor: '#74b99c',
+            fillOpacity: .14,
+            opacity: .65,
+            weight: 2
+        }).addTo(map);
+        userMarker = L.circleMarker(userLatLng, {
+            radius: 9, color: '#ffffff', fillColor: '#204637', fillOpacity: 1, weight: 4
+        }).bindTooltip('You are here', {
+            permanent: true, direction: 'top', offset: [0, -8], className: 'user-tooltip'
+        }).bindPopup(`<strong>Your current location</strong><br><small>Accuracy: about ${Math.round(accuracy)} m<br>Updated ${updated.toLocaleTimeString()}</small>`)
+            .addTo(map);
+        map.setView(userLatLng, 15);
+        window.invalidateMapSize();
+    };
+
+    window.clearUserLocation = function () {
+        if (userMarker) map.removeLayer(userMarker);
+        if (userAccuracyCircle) map.removeLayer(userAccuracyCircle);
+        userMarker = null;
+        userAccuracyCircle = null;
+        userLatLng = null;
+        window.invalidateMapSize();
+    };
+
+    window.applyNativeState = function (filter, latitude, longitude, accuracyMeters, timestampMillis, zones) {
+        window.setDangerZones(zones);
+        rebuildContextOverlays(latitude, longitude);
+        window.setSignalFilter(filter);
+        if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
+            window.setUserLocation(latitude, longitude, accuracyMeters, timestampMillis);
+        }
+        window.invalidateMapSize();
+    };
+
+    document.addEventListener('DOMContentLoaded', () => { window.invalidateMapSize(); notifyAndroidReady(); });
+    window.addEventListener('resize', window.invalidateMapSize);
+    if (window.ResizeObserver) new ResizeObserver(window.invalidateMapSize).observe(document.getElementById('map'));
+    requestAnimationFrame(() => { window.invalidateMapSize(); notifyAndroidReady(); });
+</script>
+</body>
+</html>
