@@ -20,17 +20,6 @@ encrypted, tamper-evident audio evidence capture, entirely stored on-device.
   entry where the recomputed hash breaks from the recorded one
 - Local evidence vault UI with permission-denied feedback (mic/location)
 
-## Known limitations (be upfront about these in the demo)
-- **Safeword detection is not guaranteed fully offline.** We request the
-  on-device recognizer via `EXTRA_PREFER_OFFLINE`, but Android does not
-  guarantee this on every device/OS version — some devices will still route
-  audio through a cloud speech API. A dedicated offline wake-word engine
-  (e.g. OpenWakeWord/Porcupine) is the correct long-term fix; see below.
-- The bundled YAMNet threat-scoring weights are a reasonable first pass but
-  have not been validated against a labeled real-world dataset.
-- No background/foreground-service mode yet — the app only listens/records
-  while in the foreground.
-
 ## What remains for the full version
 1. Replace the SpeechRecognizer safeword trigger with a dedicated offline
    wake-word model (OpenWakeWord/TFLite) for a real offline guarantee.
